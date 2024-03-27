@@ -1,0 +1,12 @@
+[package]
+name = "example_runner"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-tensorrt = { git = "https://github.com/m-dahl/async-tensorrt-lean", rev = "7c7a95b", features = ["lean"] }
+async-cuda = "0.5.4"
+tokio = { version = "1", features = [ "full" ] }
+image = "0.25.1"
