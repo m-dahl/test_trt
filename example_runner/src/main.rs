@@ -6,7 +6,7 @@ use image::{self, Pixel};
 #[tokio::main]
 async fn main() {
     // Load our engine file prepared by the builder.
-    let mut f = File::open("build.engine").unwrap();
+    let mut f = File::open("/mnt/obstacles_640x360_i8.engine").unwrap();
     let mut buffer = Vec::new();
     f.read_to_end(&mut buffer).unwrap();
 
@@ -34,7 +34,7 @@ async fn main() {
     }
 
     // Load image.
-    let img = image::open("input.jpg").expect("File not found!");
+    let img = image::open("/mnt/test_input.jpg").expect("File not found!");
     let mut rgb = img.clone().into_rgba8();
 
     let input_len: usize = 360 * 640 * 3;
@@ -105,7 +105,7 @@ async fn main() {
     }
     rgb.save("/mnt/output.png").expect("Could not save image");
 
-    println!("Doned. Hits {} / {}.", hits, output.len());
+    println!("Done. Hits {} / {}.", hits, output.len());
 }
 
 

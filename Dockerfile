@@ -92,15 +92,5 @@ ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/TensorRT-8.6.1.6/lib
 # Copy the runner binary from the builder stage
 WORKDIR /example_runner
 COPY --from=builder /example_runner/target/release/example_runner example_runner
-# Copy prepared engine (see above for builder)
-# COPY build.engine.gpss build.engine
-# COPY build.fp16.engine build.engine
-# COPY trt_fp16/obstacles_640x360_fp16.engine build.engine
-# COPY trt_i8/obstacles_640x360_i8.engine build.engine
-
-# COPY test.engine build.engine
-
-# Copy test input
-# COPY trt_fp32/06-08-31-387725.jpg input.jpg
 
 CMD ["./example_runner"]
