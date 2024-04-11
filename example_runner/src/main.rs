@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::fs::File;
-use image::{self, Pixel};
+use image::{self, Pixel, RgbImage};
 
 #[tokio::main]
 async fn main() {
     // Load our engine file prepared by the builder.
-    let mut f = File::open("/mnt/obstacles_640x360_i8.engine").unwrap();
+    let mut f = File::open("/mnt/obstacles_640x360_i8.engine").expect("Could not load engine file");
     let mut buffer = Vec::new();
     f.read_to_end(&mut buffer).unwrap();
 
@@ -35,10 +35,7 @@ async fn main() {
 
     // Load image.
     let img = image::open("/mnt/test_input.jpg").expect("File not found!");
-    let mut rgb = img.clone().into_rgba8();
-
-    let input_len: usize = 360 * 640 * 3;
-    let mut input_buf = vec![0f32; input_len];
+    let rgb = img.clone().into_rgb8();
 
     // From MMSegment pipeline.json:
     // Pre-processing:
@@ -54,19 +51,9 @@ async fn main() {
     //     57.375
     // ],
     // "to_rgb": true
-
-    // Separate channels (i.e. Input shape: [1, 3, 360, 640])
-    let mut i = 0usize;
-    let wh = (rgb.width() * rgb.height()) as usize;
-    for y in 0 .. rgb.height() {
-        for x in 0 .. rgb.width() {
-            let p = rgb.get_pixel(x,y);
-            input_buf[i] = ((p.0[2] as f32) - 123.675) / 58.395;
-            input_buf[i + wh] = ((p.0[1] as f32) - 116.28) / 57.12;
-            input_buf[i + 2 * wh] = ((p.0[0] as f32) - 103.53) / 57.375;
-            i+=1;
-        }
-    }
+    let input_buf = image_to_tensor(&rgb,
+                                    &[123.675, 116.28, 103.53],
+                                    &[58.395, 57.12, 57.375]);
 
     let output_len: usize = 1 * 1 * 360 * 640;
     let output = vec![0i32; output_len];
@@ -92,27 +79,44 @@ async fn main() {
     let mut i = 0;
     let mut hits = 0;
 
-    for y in 0 .. rgb.height() {
-        for x in 0 .. rgb.width() {
-            let p = rgb.get_pixel_mut(x,y);
-            if output[i] == 1 {
-                let green_blend = Pixel::from_slice(&[0, 255, 0, 148]);
-                p.blend(&green_blend);
-                hits += 1;
-            }
-            i+=1;
+    let mut rgb = img.into_rgba8();
+    for p in rgb.pixels_mut() {
+        if output[i] == 1 {
+            let green_blend = Pixel::from_slice(&[0, 255, 0, 148]);
+            p.blend(&green_blend);
+            hits += 1;
         }
+        i+=1;
     }
     rgb.save("/mnt/output.png").expect("Could not save image");
 
     println!("Done. Hits {} / {}.", hits, output.len());
 }
 
+/// Preprocess the image.
+///
+/// Perform per channel normalization as well as separate the
+/// channels (go from h * w * 3 to 3 * h * w)
+fn image_to_tensor(image: &RgbImage,
+                   rgb_mean: &[f32; 3],
+                   rgb_stddev: &[f32; 3]) -> Vec<f32> {
+    let wh = (image.width() * image.height()) as usize;
+    let mut tensor = vec![0.0f32; 3 * wh];
+    let mut i = 0usize;
+    for p in image.pixels() {
+        tensor[i] = ((p.0[0] as f32) - rgb_mean[0]) / rgb_stddev[0];
+        tensor[i + wh] = ((p.0[1] as f32) - rgb_mean[1]) / rgb_stddev[1];
+        tensor[i + 2 * wh] = ((p.0[2] as f32) - rgb_mean[2]) / rgb_stddev[2];
+        i+=1;
+    }
+    tensor
+}
+
 
 // Just using the below functions to erase the type since
 // the hashmap input for enqueue is typed and we have different
 // output and input types.
-pub async fn to_device_bytes<T: Copy>(slice: &[T], stream: &async_cuda::Stream) -> async_cuda::DeviceBuffer<u8> {
+async fn to_device_bytes<T: Copy>(slice: &[T], stream: &async_cuda::Stream) -> async_cuda::DeviceBuffer<u8> {
     let num_bytes = slice.len() * std::mem::size_of::<T>();
     let byte_slice: &[u8] = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8,
                                                                 num_bytes) };
@@ -122,12 +126,14 @@ pub async fn to_device_bytes<T: Copy>(slice: &[T], stream: &async_cuda::Stream) 
     return device_buffer;
 }
 
-pub async fn from_device_bytes<T: Copy>(device_buffer: &async_cuda::DeviceBuffer<u8>,
+async fn from_device_bytes<T: Copy>(device_buffer: &async_cuda::DeviceBuffer<u8>,
                                         stream: &async_cuda::Stream) -> Vec<T> {
     let num_bytes = device_buffer.num_elements();
     let num_elements = num_bytes / std::mem::size_of::<T>();
     let mut host_buffer: async_cuda::HostBuffer<u8> = async_cuda::HostBuffer::new(num_bytes).await;
     device_buffer.copy_to(&mut host_buffer, &stream).await.unwrap();
-    let slice: &[T] = unsafe { std::slice::from_raw_parts(host_buffer.inner().as_internal().as_ptr() as *const T, num_elements) };
+    let slice: &[T] = unsafe {
+        std::slice::from_raw_parts(host_buffer.inner().as_internal().as_ptr() as *const T, num_elements)
+    };
     return slice.to_vec();
 }
