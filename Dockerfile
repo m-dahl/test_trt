@@ -65,11 +65,12 @@ RUN mkdir /example_runner
 COPY ./example_runner/Cargo.toml /example_runner
 RUN mkdir /example_runner/src && echo "fn main() {}" > /example_runner/src/main.rs
 RUN cd /example_runner && . ~/.cargo/env && cargo build --release
-# Delete dummy main file.
-RUN rm /example_runner/src/main.rs
+# Delete dummy src folder.
+RUN rm -rf /example_runner/src
 
 # Build rust example runner (runs inference using engine file produced before)
-COPY ./example_runner /example_runner
+COPY ./example_runner/src /example_runner/src
+RUN touch /example_runner/src/main.rs
 RUN cd /example_runner && . ~/.cargo/env && cargo build --release
 
 # STAGE2: create a slim(mer) image with the compiled runner binary
