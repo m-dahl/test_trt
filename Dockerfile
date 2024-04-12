@@ -63,7 +63,7 @@ RUN cd /example_builder && . ~/.cargo/env && cargo build --release # cargo run -
 # Download and build dependencies
 RUN mkdir /example_runner
 COPY ./example_runner/Cargo.toml /example_runner
-RUN mkdir /example_runner/src && echo "fn main() {}" > /example_runner/src/main.rs
+RUN mkdir /example_runner/src && echo "fn main() { println!(\"Docker cache error.\"); }" > /example_runner/src/main.rs
 RUN cd /example_runner && . ~/.cargo/env && cargo build --release
 # Delete dummy src folder.
 RUN rm -rf /example_runner/src
