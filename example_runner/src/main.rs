@@ -6,11 +6,43 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, Duration};
 use async_channel::{Receiver, Sender};
 use clap::Parser;
+use tracing::{debug, info, error};
 
 const IMG_WIDTH: usize = 640;
 const IMG_HEIGHT: usize = 360;
 
-// Make a version of this that sources images from the redis server at tuve.
+pub async fn populate_dummy_redis(redis_uri: String) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Writing dummy camera data to redis");
+    use redis::aio::Connection;
+    use redis::AsyncCommands;
+
+    let r = redis::Client::open(redis_uri)?;
+    let mut r: Connection = r.get_async_connection().await?;
+
+    for entry in fs::read_dir("/mnt/dummy_camera_data")? {
+        let entry = entry?;
+        let path = entry.path();
+
+        let is_file = fs::metadata(&path)?.is_file();
+        let is_jpg = path.extension() == Some(std::ffi::OsStr::new("jpg"));
+
+        if is_file && is_jpg {
+            let mut f = File::open(&path).expect("Could not load jpg");
+            let mut buffer = Vec::new();
+            f.read_to_end(&mut buffer).unwrap();
+            let key = path.file_stem()
+                .and_then(|f| f.to_str())
+                .unwrap_or("no_filename").to_string();
+            r.set(key.clone(), buffer).await?;
+            debug!("Wrote {}", key);
+        }
+    }
+
+    Ok(())
+}
+
+
+// Reads all jpg:s in a directory and sends on input channel.
 async fn read_data_dir<P: AsRef<Path>>(data_dir: P, input_tx: Sender<(String,
                                                                       RgbaImage,
                                                                       Vec<f32>)>) -> std::io::Result<()> {
@@ -31,16 +63,65 @@ async fn read_data_dir<P: AsRef<Path>>(data_dir: P, input_tx: Sender<(String,
             let name = path.file_stem()
                 .and_then(|f| f.to_str())
                 .unwrap_or("no_filename").to_string();
-            // println!("Prepared image: {}", name);
+            debug!("Prepared image: {}", name);
             if input_tx.send((name,rgba, tensor)).await.is_err() {
-                println!("Sending failed");
+                error!("Sending failed");
             };
         }
     }
     Ok(())
 }
 
-// Make a version of this that save results to the redis server at tuve.
+async fn redis_input_stream(
+    redis_uri: String,
+    cameras: Vec<String>,
+    input_tx: Sender<(String,RgbaImage,Vec<f32>)>) -> Result<(), Box<dyn std::error::Error>> {
+    use redis::aio::Connection;
+    use redis::AsyncCommands;
+
+    let r = redis::Client::open(redis_uri)?;
+    let mut r: Connection = r.get_async_connection().await?;
+
+    // loop through the cameras forever (round robin).
+    let mut counter = 0;
+    for key in cameras.iter().cycle() {
+        let get_input_start = Instant::now();
+        let bytes: Vec<u8> = r.get(&key).await?;
+
+        let img = image::load_from_memory_with_format(
+            &bytes,
+            image::ImageFormat::Jpeg
+        )?;
+        let rgba = img.into_rgba8();
+        let tensor = image_to_tensor(&rgba,
+                                     &[123.675, 116.28, 103.53],
+                                     &[58.395, 57.12, 57.375]);
+
+        let get_input_dur = get_input_start.elapsed();
+        debug!("Prepared image: {} in {}us (channel size: {})",
+               key, get_input_dur.as_micros(), input_tx.len());
+
+        // for testing panic if the channel gets full (inference cannot keep up,
+        // then we need to switch to a channel implementation that can ditch the oldest
+        // elements when full).
+        if input_tx.is_full() {
+            panic!("Inference too slow!");
+        }
+
+        if input_tx.send((key.to_owned(),rgba,tensor)).await.is_err() {
+            error!("Sending failed");
+        };
+
+        // for testing only run through some images then exit.
+        counter += 1;
+        if counter > 5000 {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 async fn write_data_dir(data_dir: &str, mask_rx: Receiver<(String,
                                                            RgbaImage,
                                                            Vec<i32>)>) -> std::io::Result<usize> {
@@ -59,14 +140,40 @@ async fn write_data_dir(data_dir: &str, mask_rx: Receiver<(String,
             i+=1;
         }
         rgba.save(path).expect("Could not save image");
-        // println!("Saved result {}", name);
+        debug!("Saved result {}", name);
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// TODO: Save to the redis server. Need to create polygons to integrate with old code?
+/// For now we don't use the inference results we count how many results we get per second.
+async fn dummy_output(mask_rx: Receiver<(String,RgbaImage,Vec<i32>)>) -> Result<usize, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let mut count = 0;
+    while let Ok((_name, mut rgba, mask)) = mask_rx.recv().await {
+        let mut i = 0;
+        // Do some processing just for fun.
+        for p in rgba.pixels_mut() {
+            if mask[i] == 1 {
+                p.blend(&Pixel::from_slice(&[0, 255, 0, 148]));
+            }
+            i+=1;
+        }
+
+        // Throw away result, but print stats now and then instead.
+        if count % 100 == 0 {
+            let fps = (count as f32) / start.elapsed().as_secs_f32();
+            info!("Avg FPS: {}", fps);
+        }
         count += 1;
     }
     Ok(count)
 }
 
 /// Perform inference on the input data until the channel closes.
-async fn inference_task(mut context: async_tensorrt::ExecutionContext<'_>,
+async fn inference_task(index: usize,
+                        mut context: async_tensorrt::ExecutionContext<'_>,
                         input_rx: Receiver<(String, RgbaImage, Vec<f32>)>,
                         output_tx: Sender<(String, RgbaImage, Vec<i32>)>) {
     let stream = async_cuda::Stream::new().await.unwrap();
@@ -87,7 +194,7 @@ async fn inference_task(mut context: async_tensorrt::ExecutionContext<'_>,
     ]);
 
     while let Ok((name,img,input_tensor)) = input_rx.recv().await {
-        // let inf_start = Instant::now();
+        let inf_start = Instant::now();
         if let Some(input) = io_buffers.get_mut("input") {
             let slice: &[u8] = unsafe { std::slice::from_raw_parts(input_tensor.as_ptr() as *const u8,
                                                                    num_input_bytes) };
@@ -109,10 +216,10 @@ async fn inference_task(mut context: async_tensorrt::ExecutionContext<'_>,
         };
         let output = slice.to_vec();
 
-        // let inf_dur = inf_start.elapsed();
-        // println!("Inference done in {}us", inf_dur.as_micros());
+        let inf_dur = inf_start.elapsed();
+        debug!("Inference({}) on {} done in {}us", index, name, inf_dur.as_micros());
         if output_tx.send((name, img, output)).await.is_err() {
-            println!("Could not send inference result");
+            error!("Could not send inference result");
         }
     }
 }
@@ -151,22 +258,22 @@ async fn benchmark(model: &str, num_workers: usize) -> (usize, Duration) {
         let input_rx_clone = input_rx.clone();
         {
             inference_tasks.spawn(async move {
-                inference_task(context, input_rx_clone, output_tx_clone).await;
+                inference_task(i, context, input_rx_clone, output_tx_clone).await;
                 return i;
             });
         }
     }
 
     // finish all inference jobs.
-    while let Some(_res) = inference_tasks.join_next().await {
-        // println!("Finished worker task: {:?}", res);
+    while let Some(res) = inference_tasks.join_next().await {
+        debug!("Finished worker task: {:?}", res);
     }
 
     // Inference done.
     let duration = start.elapsed();
 
     // finish write stream.
-    drop(output_tx);
+    output_tx.close();
 
     // save results (not really needed)
     write_data_dir("/mnt/output", output_rx).await.expect("Could not write files");
@@ -178,6 +285,19 @@ async fn benchmark(model: &str, num_workers: usize) -> (usize, Duration) {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    let level = if args.verbose {
+        tracing::Level::TRACE
+    } else {
+        tracing::Level::INFO
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .init();
+
+    if args.dummy_redis {
+        populate_dummy_redis(args.redis_uri.clone()).await.unwrap();
+    }
 
     if args.bench {
         let models = &["/mnt/tensorrt_models/ampere_plus/trt_fp32/obstacles_640x360_fp32.engine",
@@ -197,20 +317,9 @@ async fn main() {
 
     let start = Instant::now();
 
-    let (input_tx, input_rx) = async_channel::bounded(10);
-    let (output_tx, output_rx) = async_channel::bounded(10);
-    let input_jh = tokio::task::spawn(async {
-        println!("Loading images start.");
-        read_data_dir("/mnt/vt_data", input_tx).await.expect("Could not files");
-        println!("Loading images done.");
-    });
-
-    let output_jh = tokio::task::spawn(async {
-        println!("Saving images start.");
-        let count = write_data_dir("/mnt/output", output_rx).await;
-        println!("Saving images done.");
-        count
-    });
+    let cameras: Vec<String> = args.cameras.split(",").map(|s|s.to_string()).collect();
+    let (input_tx, input_rx) = async_channel::bounded(cameras.len());
+    let (output_tx, output_rx) = async_channel::bounded(cameras.len());
 
     // Load our engine file prepared by the builder.
     let mut f = File::open(&args.model_file).expect("Could not load engine file");
@@ -249,25 +358,40 @@ async fn main() {
         let input_rx_clone = input_rx.clone();
         {
             inference_tasks.spawn(async move {
-                inference_task(context, input_rx_clone, output_tx_clone).await;
+                inference_task(i, context, input_rx_clone, output_tx_clone).await;
                 return i;
             });
         }
     }
 
+    // Start IO tasks.
+    let input_redis_uri = args.redis_uri.clone();
+    let input_jh = tokio::task::spawn(async move {
+        debug!("Loading images start.");
+        redis_input_stream(input_redis_uri, cameras, input_tx).await.expect("Redis read error.");
+        debug!("Loading images done.");
+    });
+
+    let output_jh = tokio::task::spawn(async {
+        debug!("Saving images start.");
+        let count = dummy_output(output_rx).await.expect("Redis write error.");
+        debug!("Saving images done.");
+        count
+    });
+
     // finish all inference jobs.
     while let Some(res) = inference_tasks.join_next().await {
-        println!("Finished worker task: {:?}", res);
+        debug!("Finished worker task: {:?}", res);
     }
 
     // finish write stream.
-    drop(output_tx);
+    output_tx.close();
 
     input_jh.await.unwrap();
-    let num_images = output_jh.await.unwrap().unwrap();
+    let num_images = output_jh.await.unwrap();
 
     let duration = start.elapsed();
-    println!("Processed {} images in {}ms (including disk io)", num_images, duration.as_millis());
+    println!("Processed {} images in {}ms (including network io)", num_images, duration.as_millis());
     println!("Avg time per image: {}us", duration.as_micros() / (num_images as u128));
 }
 
@@ -300,6 +424,22 @@ struct Args {
     /// Model name
     #[arg(short, long, default_value_t = String::from("/mnt/tensorrt_models/ampere_plus/trt_fp16/obstacles_640x360_fp16.engine"))]
     model_file: String,
+
+    /// Redis uri
+    #[arg(short, long, default_value_t = String::from("redis://localhost:6379"))]
+    redis_uri: String,
+
+    /// Verbose
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
+
+    /// Populate redis server with dummy images.
+    #[arg(short, long, default_value_t = false)]
+    dummy_redis: bool,
+
+    /// Camera redis keys. Comma separated.
+    #[arg(short, long, default_value_t = String::from("140,141,142,143,144,145,146,147,148,149"))]
+    cameras: String,
 
     /// Benchmark mode
     #[arg(short, long, default_value_t = false)]
