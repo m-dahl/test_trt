@@ -94,4 +94,4 @@ ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/TensorRT-8.6.1.6/lib
 WORKDIR /example_runner
 COPY --from=builder /example_runner/target/release/example_runner example_runner
 
-CMD ["./example_runner"]
+ENTRYPOINT ["./example_runner"]
